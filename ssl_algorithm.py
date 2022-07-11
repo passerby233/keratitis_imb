@@ -4,7 +4,6 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 
-from dataset import BalancedSampler
 from supervise import test
 from utils import save_model
 
@@ -24,8 +23,8 @@ def get_pseudo(t_model, unlabeled_dataset):
     """
     t_model.eval()
     device = next(t_model.parameters()).device
-    unlabeled_loader = DataLoader(unlabeled_dataset, batch_size=1400, shuffle=False,
-                                  num_workers=32, pin_memory=True)                                  
+    unlabeled_loader = DataLoader(unlabeled_dataset, batch_size=1280, shuffle=False,
+                                  num_workers=32, pin_memory=False)                                  
     with torch.no_grad():
         for step, data in enumerate(tqdm(unlabeled_loader)):
             images, _ = data
@@ -114,25 +113,23 @@ def consistent(pseudo_list, threshold, ema_list):
     return pseudo_mean, selected_index, class_length, pseudo_std, ema_list
 
 
-def ssl_train(s_model, labeled_trainset, labeled_valset, monitor,
-              selected_unlset, all_pseudo, class_length, all_pseudo_std,
-              optimizer, T_cur, args, tmp_save_path, alpha=1.0):
+def cal_unl_loss(y_us, pseudo_pred, pseudo_form):
+    if pseudo_form == 'hard':
+        L_unl = F.cross_entropy(y_us, pseudo_pred.argmax(-1))
+    elif pseudo_form == 'soft':
+        prob, pseudo_label = pseudo_pred.max(-1)
+        L_unl = F.cross_entropy(y_us, pseudo_label, reduction='none') @ prob / y_us.shape[0]
+    elif pseudo_form == 'kl':
+        L_unl = F.kl_div(F.log_softmax(y_us, dim=-1), pseudo_pred, reduction='batchmean')
+    else:
+        raise Exception(f'Unrecognized mode {pseudo_form}')
+    return L_unl
+
+
+def ssl_train(s_model, dataloaders, raw_unl_loader, all_pseudo, all_pseudo_std,
+              optimizer, T_cur, args, tmp_save_path, scheduler=None):
     device = next(s_model.parameters()).device
     scaler = GradScaler()
-    val_loader = DataLoader(labeled_valset, batch_size=args.batch_size, shuffle=False,
-                                num_workers=args.num_workers, pin_memory=True)
-    if args.sampler == 'balanced':
-        raw_lab_loader = DataLoader(labeled_trainset, batch_size=args.batch_size,
-                                    sampler=BalancedSampler(labeled_trainset),
-                                    num_workers=args.num_workers, pin_memory=True)
-        raw_unl_loader = DataLoader(selected_unlset, batch_size=args.distill_bs,
-                                    sampler=BalancedSampler(selected_unlset, class_length),
-                                    num_workers=args.num_workers, pin_memory=True)
-    else:
-        raw_lab_loader = DataLoader(labeled_trainset, batch_size=args.batch_size, shuffle=True,
-                                    num_workers=args.num_workers, pin_memory=True)
-        raw_unl_loader = DataLoader(selected_unlset, batch_size=args.distill_bs, shuffle=True,
-                                    num_workers=args.num_workers, pin_memory=True)
 
     unl_loader = iter(raw_unl_loader)
     all_pseudo = torch.from_numpy(all_pseudo)
@@ -143,11 +140,10 @@ def ssl_train(s_model, labeled_trainset, labeled_valset, monitor,
         upper = T_cur / args.distill_iter * (max_u - min_u) + min_u
 
     logging.info(f'Distilling Procedure, Iter {T_cur}:')
-    max_metric, best_epoch, best_report, best_report_dict = 0, 0, None, None
     with tqdm(total=args.distill_epochs, desc='Distilling') as pbar:
         for epoch in range(args.distill_epochs):
             s_model.train()  # To ensure BN to be updated in each iter
-            for lab_images, y_label in raw_lab_loader:
+            for lab_images, y_label in dataloaders['train']:
                 try:
                     unl_images, indexes = next(unl_loader)
                 except StopIteration:
@@ -175,24 +171,20 @@ def ssl_train(s_model, labeled_trainset, labeled_valset, monitor,
                             L_unl = F.cross_entropy(y_us, pseudo_pred.argmax(-1), reduction='none') @ beta / y_us.shape[0]
                         else:
                             L_unl = F.cross_entropy(y_us, pseudo_label, reduction='none') @ prob / y_us.shape[0]
-                    elif args.pseudo_form == 'hard':
-                        L_unl = F.cross_entropy(y_us, pseudo_pred.argmax(-1))
-                    elif args.pseudo_form == 'soft':
-                        prob, pseudo_label = pseudo_pred.max(-1)
-                        L_unl = F.cross_entropy(y_us, pseudo_label, reduction='none') @ prob / y_us.shape[0]
-                    elif args.pseudo_form == 'kl':
-                        L_unl = F.kl_div(F.log_softmax(y_us, dim=-1), pseudo_pred, reduction='batchmean')
                     else:
-                        raise Exception(f'Unrecognized mode {args.pseudo_form}')
-                    loss = L_sup + alpha * L_unl
+                        L_unl = cal_unl_loss(y_us, pseudo_pred, args.pseudo_form)
+                    loss = L_sup + args.alpha * L_unl
                 loss_value, L_sup_value, L_unl_value = loss.item(), L_sup.item(), L_unl.item()
+
                 # Optimize step
                 optimizer.zero_grad()
-
                 if args.use_amp:
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
+                    scheduler.step()
+                else:
+                    raise Exception("Only Support args.use_amp=True")
 
             # tqdm logging
             pbar.set_postfix({'loss': f'{loss_value:.3f}',
@@ -201,7 +193,7 @@ def ssl_train(s_model, labeled_trainset, labeled_valset, monitor,
             pbar.update()
 
         # Test at last epoch on validation set
-        report, report_dict = test(s_model, val_loader)  # Will call s_model.eval() inside  
+        report, report_dict = test(s_model, dataloaders['val'])  # Will call s_model.eval() inside  
         save_model(s_model, tmp_save_path)
 
     return report, report_dict

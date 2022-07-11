@@ -1,0 +1,15 @@
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+*.pth
+outputs/
+byol_save/
+dummy.py
+tmp.npy
+events*
+analyse
+ablation
+analyse/calibrator
+analyse/features
+analyse/prediction
+!.gitkeep

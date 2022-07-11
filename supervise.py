@@ -167,11 +167,11 @@ def main():
             torch.save(model.module.state_dict(), save_path)
         else:
             torch.save(model.state_dict(), save_path)
-        best_report, best_report_dict = test(model, loader['test'])
-        print('Report on Test Set:\n' + best_report)
+        test_report, test_report_dict = test(model, loader['test'])
+        print('Report on Test Set:\n' + test_report)
         with open(report_path ,'w') as f:
-            json.dump(best_report_dict, f)
-        report_list.append(best_report_dict)
+            json.dump(test_report, f)
+        report_list.append(test_report_dict)
 
     # get average report of 5_cross, save to path
     avg_report_path = os.path.join(exp_dir, f'{args.expid}_cross.json')
